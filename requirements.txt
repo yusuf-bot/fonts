@@ -1,0 +1,8 @@
+numpy
+Pillow
+requests
+tensorflow>=2.0
+scikit-learn
+opencv-python
+matplotlib
+
