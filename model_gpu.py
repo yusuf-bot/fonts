@@ -372,5 +372,5 @@ def predict_font(image_path: str, top_k: int = 5) -> List[Tuple[str, float]]:
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
-    api_key = os.getenv("GOOGLE_FONTS_API_KEY", "YOUR_GOOGLE_FONTS_API_KEY")
+    api_key = 'AIzaSyCvk7bGu7QkjeFl5K4F1nGij48r3ITxkZg'
     GoogleFontClassifier(api_key).run_full_pipeline()
