@@ -44,6 +44,8 @@ LABEL_ENC_PATH = Path("label_encoder.pkl")
 HIST_PATH = Path("training_history.pkl")
 FONT_LIST_PATH = Path("font_list.pkl")
 FONT_LABELS_PATH = Path("font_labels.pkl")
+CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 for p in (FONTS_DIR, DATA_DIR):
     p.mkdir(exist_ok=True)
@@ -67,6 +69,35 @@ def clean_temp():
         shutil.rmtree(p, ignore_errors=True)
         log(f"Removed {p}")
 
+def extract_features(img: np.ndarray) -> np.ndarray:
+    img = (img * 255).astype(np.uint8)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    edges = (cv2.Canny(gray, 100, 200) / 255.0).astype(np.float32)
+    dil = (cv2.dilate(gray, np.ones((3, 3)), 1) / 255.0).astype(np.float32)
+    return np.stack([gray / 255.0, edges, dil], axis=-1)
+
+def build_model(n_classes: int) -> tf.keras.Model:
+    base = ResNet50(weights="imagenet", include_top=False, input_shape=(*IMG_SIZE, 3))
+    for layer in base.layers[:-40]:
+        layer.trainable = False
+    inp = tf.keras.Input((*IMG_SIZE, 3))
+    x = base(inp)
+    x = CBAM()(x)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(1024, activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
+    x = Dense(512, activation="relu")(x)
+    x = Dropout(0.5)(x)
+    out = Dense(n_classes, activation="softmax", dtype="float32")(x)
+    model = tf.keras.Model(inp, out)
+    lr = 0.001 if n_classes < 100 else 0.0005 if n_classes < 500 else 0.0001
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(lr),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy", "top_k_categorical_accuracy"],
+    )
+    return model
 # --------------------------------------------------------------------------- #
 # FONT DOWNLOAD                                                               #
 # --------------------------------------------------------------------------- #
@@ -231,53 +262,32 @@ class DatasetBuilder:
 # MODEL                                                                       #
 # --------------------------------------------------------------------------- #
 class CBAM(tf.keras.layers.Layer):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, reduction_ratio=16, **kwargs):
+        super().__init__(**kwargs)
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        ch = input_shape[-1]
+        self.dense1 = Dense(ch // self.reduction_ratio, activation="relu")
+        self.dense2 = Dense(ch)
+        self.spatial_conv = Conv2D(1, 7, padding="same", activation="sigmoid")
+        super().build(input_shape)
 
     def call(self, inputs):
-        # channel attention
+        # --- Channel attention (built once) ---
         avg = GlobalAveragePooling2D()(inputs)
         mx = tf.keras.layers.GlobalMaxPooling2D()(inputs)
-        dense1 = Dense(inputs.shape[-1] // 16, activation="relu")
-        dense2 = Dense(inputs.shape[-1])
-        att = tf.keras.activations.sigmoid(
-            Add()([dense2(dense1(avg)), dense2(dense1(mx))])
+        att = tf.nn.sigmoid(
+            Add()([self.dense2(self.dense1(avg)), self.dense2(self.dense1(mx))])
         )
         x = Multiply()([inputs, att])
-        # spatial
+
+        # --- Spatial attention (built once) ---
         avg = tf.reduce_mean(x, axis=-1, keepdims=True)
         mx = tf.reduce_max(x, axis=-1, keepdims=True)
         concat = Concatenate(axis=-1)([avg, mx])
-        spatial = Conv2D(1, 7, padding="same", activation="sigmoid")(concat)
-        return Multiply()([x, spatial])
-
-class ModelBuilder:
-    def __init__(self, n_classes: int):
-        self.n_classes = n_classes
-
-    def build(self) -> tf.keras.Model:
-        base = ResNet50(weights="imagenet", include_top=False, input_shape=(*IMG_SIZE, 3))
-        for layer in base.layers[:-40]:
-            layer.trainable = False
-        inp = tf.keras.Input((*IMG_SIZE, 3))
-        x = base(inp)
-        x = CBAM()(x)
-        x = GlobalAveragePooling2D()(x)
-        x = Dense(1024, activation="relu")(x)
-        x = BatchNormalization()(x)
-        x = Dropout(0.5)(x)
-        x = Dense(512, activation="relu")(x)
-        x = Dropout(0.5)(x)
-        out = Dense(self.n_classes, activation="softmax", dtype="float32")(x)
-        model = tf.keras.Model(inp, out)
-        lr = 0.001 if self.n_classes < 100 else 0.0005 if self.n_classes < 500 else 0.0001
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(lr),
-            loss="sparse_categorical_crossentropy",
-            metrics=["accuracy", "top_k_categorical_accuracy"],
-        )
-        log(f"Model built, lr={lr}")
-        return model
+        spat = self.spatial_conv(concat)
+        return Multiply()([x, spat])
 
 # --------------------------------------------------------------------------- #
 # TRAINING                                                                    #
@@ -287,32 +297,52 @@ class Trainer:
         self.num_batches = num_batches
         self.label_enc = label_enc
 
-    def _gen(self):
+    def ds_gen(self):
         for b in range(self.num_batches):
             data = np.load(DATA_DIR / f"batch_{b}.npz")
-            for x in data["X"]:
-                yield extract_features(x), None
+            for x, y in zip(data["X"], data["y"]):
+                yield extract_features(x), np.int32([self.label_enc.transform([y])[0]])
 
     def _make_ds(self):
         ds = tf.data.Dataset.from_generator(
-            lambda: self._gen(),
+            self.ds_gen,
             output_signature=(
-                tf.TensorSpec(shape=(*IMG_SIZE, 3), dtype=tf.float16),
-                tf.TensorSpec(shape=(), dtype=tf.int32),
+                tf.TensorSpec(shape=(*IMG_SIZE, 3), dtype=tf.float32),
+                tf.TensorSpec(shape=(1,), dtype=tf.int32),
             ),
         )
         return ds.cache().shuffle(1000).batch(64).prefetch(tf.data.AUTOTUNE)
 
-    def train(self, epochs: int = 100) -> tf.keras.callbacks.History:
+    def train(self, epochs: int = 100):
         val = np.load(DATA_DIR / f"batch_{self.num_batches-1}.npz")
-        X_val = np.array([extract_features(x) for x in val["X"]], np.float16)
+        X_val = np.array([extract_features(x) for x in val["X"]], np.float32)
         y_val = self.label_enc.transform(val["y"])
 
-        model = ModelBuilder(len(self.label_enc.classes_)).build()
+        model = build_model(len(self.label_enc.classes_))
+        latest_ckpt = tf.train.latest_checkpoint(str(CHECKPOINT_DIR))
+        if latest_ckpt:
+            log(f"Resuming from {latest_ckpt}")
+            model.load_weights(latest_ckpt)
+        # --- Checkpointing setup ---
+        ckpt_path = CHECKPOINT_DIR / "epoch_{epoch:03d}_valacc_{val_accuracy:.4f}.h5"
         callbacks = [
-            tf.keras.callbacks.EarlyStopping(patience=25, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=10, min_lr=1e-7),
-            tf.keras.callbacks.ModelCheckpoint("best.h5", save_best_only=True),
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_accuracy", patience=25, restore_best_weights=True
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                factor=0.5, patience=10, min_lr=1e-7
+            ),
+            tf.keras.callbacks.ModelCheckpoint(
+                str(CHECKPOINT_DIR / "best.h5"),
+                save_best_only=True,
+                monitor="val_accuracy",
+                verbose=1,
+            ),
+            tf.keras.callbacks.ModelCheckpoint(
+                str(ckpt_path),
+                save_freq="epoch",
+                verbose=0,
+            ),
             tf.keras.callbacks.CSVLogger("training_log.csv", append=True),
         ]
 
